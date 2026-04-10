@@ -42,7 +42,7 @@ Tumblr · Bitbucket Pages · UserVoice · Cargo · Intercom
 ```bash
 git clone https://github.com/ShadowByte1/dnsreaper
 cd dnsreaper
-pip install requests,dnspython --break-system-packages
+pip install requests dnspython --break-system-packages
 ```
  
 **Requirements:**
