@@ -43,6 +43,7 @@ import dns.name
 import dns.query
 import dns.message
 import dns.flags
+import dns.rcode
 
 requests.packages.urllib3.disable_warnings()
 
