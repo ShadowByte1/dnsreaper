@@ -2,18 +2,17 @@
 """
 takeover.py — Subdomain Takeover & DNS Misconfiguration Scanner
 ================================================================
-Techniques used in active bug bounty research (CCC / HackerOne).
-
 Checks performed:
-  1. CNAME chain resolution → fingerprint against 25+ known vulnerable services
+  1. CNAME chain resolution → fingerprint against 50+ known vulnerable services
   2. HTTP body fingerprinting → confirm unclaimed slot
   3. Ghost NS / lame delegation → SERVFAIL = full zone takeover possible
   4. GCS bucket existence check → NoSuchBucket via GCS JSON API
   5. S3 bucket existence check → NoSuchBucket via AWS S3 XML API
   6. Azure Blob container check
-  7. Route53 hosted zone ghost check (NS records exist, zone deleted)
-  8. Already-exploited detection — third party claimed the slot and is serving content
-  9. CNAME to NXDOMAIN (dangling CNAME to deleted host)
+  7. Heroku app existence check via unauthenticated Platform API
+  8. GitHub user/org existence check via GitHub API
+  9. Already-hijacked detection — third party claimed the slot and is serving content
+     (gambling, pharma spam, XSS payloads, PoC injections, domain parking)
 
 Usage:
   python3 takeover.py -f subdomains.txt
@@ -21,7 +20,7 @@ Usage:
   python3 takeover.py -d example.com --verbose
   echo "sub.example.com" | python3 takeover.py -
 
-Author:Shadowbyte
+Author: Shadowbyte
 """
 
 import sys
@@ -546,18 +545,33 @@ NON_CLAIMABLE_CNAME_SUFFIXES = [
 # Already-taken-over content patterns (non-owner serving malicious/spam content)
 # Only include patterns that indicate a *real* hijack — not server misconfigurations.
 # Default web server pages (IIS/Nginx/Apache) are NOT included here; they're just unconfigured servers.
+#
+# Each tuple: (regex_pattern, label_shown_in_output)
+# The label should describe WHO/WHAT took it over so the report is actionable.
 HIJACKED_PATTERNS = [
-    # Confirmed malicious/spam takeover content
-    (r"เว็บพนัน|คาสิโน|สล็อต|บาคาร่า", "Thai gambling site"),
-    (r"казино|ставки|слоты|покер", "Russian gambling site"),
-    (r"online.{0,30}casino|gambling.{0,30}bonus|free.{0,30}slots|sports.{0,30}betting", "Gambling content"),
-    (r"viagra|cialis|pharmacy.*online|buy.*pills.*cheap", "Pharma spam"),
-    # Domain parking / for-sale pages
-    (r"this domain is for sale|buy this domain|domain.*available.*purchase", "Domain for sale"),
-    (r"GoDaddy.*auction|Sedo\.com.*domain|sedoparking", "Domain parking service"),
-    (r"parkingcrew\.net|bodis\.com|above\.com.*parking", "Domain parking service"),
-    # Thai gambling variant
-    (r"(?:แทงบอล|เดิมพัน|ทดลองเล่น|สมัครสมาชิก).{0,30}(?:ฟรี|เครดิต|โบนัส)", "Thai gambling site (confirmed takeover)"),
+    # ── Bug bounty / security researcher PoC injections ──────────
+    # Researchers who successfully took over a subdomain often inject one of these as proof
+    (r"console\.log\(['\"].*[Tt]akeover|[Hh]ijack|[Pp]o[Cc]|[Bb]ug\s*[Bb]ounty", "Security researcher PoC (console.log injection)"),
+    (r"<script[^>]*>\s*alert\s*\(\s*['\"](?:takeover|hijack|xss|poc|owned|pwned|h1|hackerone|bugbounty)['\"]", "Security researcher XSS PoC (alert injection)"),
+    (r"document\.title\s*=\s*['\"](?:takeover|hijack|xss|poc|owned|pwned|h1)", "Security researcher PoC (document.title injection)"),
+    (r"subdomain.{0,20}takeover|takeover.{0,20}poc|this\s+(?:sub)?domain\s+(?:has\s+been\s+)?(?:taken\s+over|hijacked|claimed)", "Security researcher takeover claim"),
+    (r"hackerone|bugcrowd|intigriti|yeswehack|synack.*report|bug\s*bounty\s*(?:poc|proof|claim)", "Bug bounty researcher claim"),
+    (r"(?:taken over|hijacked) by [a-zA-Z0-9_-]{3,30}", "Takeover claimed by researcher"),
+
+    # ── Gambling / spam ───────────────────────────────────────────
+    (r"เว็บพนัน|คาสิโน|สล็อต|บาคาร่า", "Malicious takeover: Thai gambling site"),
+    (r"(?:แทงบอล|เดิมพัน|ทดลองเล่น|สมัครสมาชิก).{0,30}(?:ฟรี|เครดิต|โบนัส)", "Malicious takeover: Thai gambling site"),
+    (r"казино|ставки|слоты|покер", "Malicious takeover: Russian gambling site"),
+    (r"online.{0,30}casino|gambling.{0,30}bonus|free.{0,30}slots|sports.{0,30}betting", "Malicious takeover: Gambling content"),
+    (r"viagra|cialis|pharmacy.*online|buy.*pills.*cheap", "Malicious takeover: Pharma spam"),
+
+    # ── Domain parking ────────────────────────────────────────────
+    (r"this domain is for sale|buy this domain|domain.*available.*purchase", "Domain parking: for sale"),
+    (r"GoDaddy.*auction|Sedo\.com.*domain|sedoparking", "Domain parking: GoDaddy/Sedo"),
+    (r"parkingcrew\.net|bodis\.com|above\.com.*parking", "Domain parking: ParkingCrew/Bodis"),
+
+    # ── Generic hostile content indicators ────────────────────────
+    (r"<script[^>]*src=['\"]https?://(?!(?:cdnjs|ajax\.googleapis|code\.jquery|cdn\.jsdelivr|unpkg))[a-z0-9.-]+\.[a-z]{2,}/[^'\"]{0,100}(?:miner|cryptojack|coinhive|coin-hive)", "Malicious takeover: Cryptojacker injected"),
 ]
 
 
@@ -734,7 +748,7 @@ def is_malformed_cname(cname_target: str, source_domain: str) -> bool:
     """
     Return True if a CNAME target looks malformed — i.e., the source domain's
     zone apex is appended to the CNAME value (common DNS misconfiguration).
-    Example: source=something.mycccportal.com, cname=okta.com.mycccportal.com
+    Example: source=sub.example.com, cname=okta.com.example.com
     """
     zone = get_zone_apex(source_domain)
     return cname_target.endswith("." + zone) and cname_target != source_domain
@@ -1445,7 +1459,7 @@ def main():
 Examples:
   python3 takeover.py -f subdomains.txt
   python3 takeover.py -f subdomains.txt -o results.json --threads 50 --verbose
-  python3 takeover.py -d preview.cccis.com
+  python3 takeover.py -d sub.example.com
   cat subdomains.txt | python3 takeover.py -
   python3 takeover.py -f live.txt --only-vulnerable
         """,
