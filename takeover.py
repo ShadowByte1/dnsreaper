@@ -2,7 +2,7 @@
 """
 takeover.py — Subdomain Takeover & DNS Misconfiguration Scanner
 ================================================================
-Techniques used in active bug bounty research (HackerOne).
+Techniques used in active bug bounty research (CCC / HackerOne).
 
 Checks performed:
   1. CNAME chain resolution → fingerprint against 25+ known vulnerable services
@@ -15,22 +15,13 @@ Checks performed:
   8. Already-exploited detection — third party claimed the slot and is serving content
   9. CNAME to NXDOMAIN (dangling CNAME to deleted host)
 
-Ghost Zone Enrichment (new):
-  - DoH-based NS IP extraction (works when raw DNS/53 is firewalled)
-  - PTR reverse lookup on NS IPs → awsdns hostnames to match
-  - DNS provider identification (Route53, Azure DNS, Cloudflare, etc.)
-  - Parent zone vs ghost zone NS cross-comparison (confirms separate deleted zone)
-  - Takeover feasibility assessment with attempt estimates
-  - AWS CLI claim command pre-built with target NS hostnames
-  - Claim loop script auto-generated per finding
-
 Usage:
   python3 takeover.py -f subdomains.txt
   python3 takeover.py -f subdomains.txt -o results.json --threads 50
   python3 takeover.py -d example.com --verbose
   echo "sub.example.com" | python3 takeover.py -
 
-Author: Shadowbyte
+Author:Shadowbyte
 """
 
 import sys
@@ -52,7 +43,6 @@ import dns.name
 import dns.query
 import dns.message
 import dns.flags
-import dns.rcode
 
 requests.packages.urllib3.disable_warnings()
 
@@ -73,438 +63,18 @@ def c(color, text): return f"{color}{text}{RESET}"
 # Thread-safety for concurrent print output
 _print_lock = threading.Lock()
 
-# Zone SERVFAIL cache
+# Zone SERVFAIL cache: avoid re-querying zone apex multiple times
 _zone_servfail_cache: dict[str, bool] = {}
 _zone_servfail_lock  = threading.Lock()
 
-# Synthetic ghost zone findings
+# Synthetic ghost zone findings: dead intermediate zones discovered via subdomain cascade
+# Maps zone_domain → ns_records (list[str])
 _synthetic_ghost_zones: dict[str, list] = {}
 _synthetic_ghost_lock  = threading.Lock()
 
-
-# ─────────────────────────────────────────────────────────────
-# Ghost Zone Enrichment Module
-# ─────────────────────────────────────────────────────────────
-
-# DNS provider patterns: keyed by provider name, values are NS hostname substrings
-DNS_PROVIDER_PATTERNS = {
-    "Route53":      ["awsdns"],
-    "Cloudflare":   ["cloudflare.com"],
-    "Google Cloud": ["googledomains.com", "cloud-dns"],
-    "Azure DNS":    ["azure-dns.com", "azure-dns.net", "azure-dns.org", "azure-dns.info"],
-    "DigitalOcean": ["digitalocean.com"],
-    "NS1":          ["nsone.net"],
-    "Fastly":       ["fastly.net"],
-    "Dyn":          ["dynect.net"],
-    "Namecheap":    ["registrar-servers.com"],
-    "GoDaddy":      ["domaincontrol.com"],
-    "Netlify":      ["netlify.com"],
-    "Vercel":       ["vercel-dns.com"],
-    "Hurricane Electric": ["he.net"],
-    "Rage4":        ["rage4.com"],
-}
-
-# Provider-specific claim instructions for ghost zones
-GHOST_ZONE_CLAIM_GUIDES = {
-    "Route53": {
-        "method":   "Create Route53 Hosted Zone repeatedly until AWS assigns matching NS servers",
-        "note":     "Route53 assigns NS servers randomly from a pool of ~500 per TLD. "
-                    "Script a create/check/delete loop until all 4 NS hostnames match. "
-                    "Zones deleted within 12 hours are not billed ($0.50/mo otherwise).",
-        "feasibility": "HIGH — widely documented, multiple confirmed HackerOne reports",
-        "steps": [
-            "1. Run the auto-generated claim script below",
-            "2. Script creates zones until NS hostnames match the target set",
-            "3. Once matched, add TXT proof record",
-            "4. Verify with DoH: curl 'https://dns.google/resolve?name=<domain>&type=TXT'",
-            "5. Screenshot DNS resolution → submit HackerOne report",
-        ],
-    },
-    "Azure DNS": {
-        "method":   "Create Azure DNS Zone — Azure lets you choose the zone name, NS are assigned",
-        "note":     "Azure DNS zones use azure-dns.{com,net,org,info} NS servers. "
-                    "Unlike Route53, Azure assigns NS servers deterministically based on zone name hash. "
-                    "Create the zone and check if assigned NS match.",
-        "feasibility": "HIGH — deterministic NS assignment means single attempt may succeed",
-        "steps": [
-            "1. az dns zone create --resource-group <rg> --name <domain>",
-            "2. az network dns zone show --name <domain> --query nameServers",
-            "3. Compare assigned NS against target NS hostnames",
-            "4. If match: add TXT record and verify",
-        ],
-    },
-    "Cloudflare": {
-        "method":   "Add zone to Cloudflare account",
-        "note":     "Cloudflare requires domain ownership verification. "
-                    "Ghost NS takeover on Cloudflare is generally NOT possible without "
-                    "registrar-level control. Investigate further before attempting.",
-        "feasibility": "LOW — ownership verification blocks most ghost zone claims",
-        "steps": [
-            "1. Add site to Cloudflare (cloudflare.com/add-site)",
-            "2. Cloudflare will request DNS verification — check if subdomain passes",
-            "3. If parent zone delegation is truly abandoned, may succeed",
-        ],
-    },
-    "DigitalOcean": {
-        "method":   "Create DigitalOcean DNS domain",
-        "note":     "DigitalOcean assigns NS servers ns1/ns2/ns3.digitalocean.com. "
-                    "If ghost zone used these exact NS, claim is straightforward.",
-        "feasibility": "HIGH — fixed NS servers, single attempt",
-        "steps": [
-            "1. doctl compute domain create <domain>",
-            "2. NS servers are always ns1/ns2/ns3.digitalocean.com",
-            "3. Add TXT proof record and verify",
-        ],
-    },
-    "Unknown": {
-        "method":   "Investigate NS provider and create matching hosted zone",
-        "note":     "Provider could not be identified. Perform PTR lookups on NS IPs "
-                    "and research the provider's zone creation process.",
-        "feasibility": "UNKNOWN — manual investigation required",
-        "steps": [
-            "1. PTR lookup each NS IP to identify hostnames",
-            "2. Research which DNS provider uses those NS patterns",
-            "3. Create account and hosted zone on that provider",
-            "4. Verify NS assignment matches ghost NS",
-        ],
-    },
-}
-
-
-def ptr_lookup_doh(ip: str) -> str:
-    """
-    Reverse PTR lookup via DoH (Google/Cloudflare).
-    Works when raw DNS port 53 is firewalled — uses HTTPS/443.
-    """
-    parts = ip.split(".")
-    arpa = ".".join(reversed(parts)) + ".in-addr.arpa"
-    for doh_url in [
-        f"https://dns.google/resolve?name={arpa}&type=PTR",
-        f"https://cloudflare-dns.com/dns-query?name={arpa}&type=PTR",
-    ]:
-        try:
-            r = requests.get(
-                doh_url, timeout=8,
-                headers={"Accept": "application/dns-json"}
-            )
-            data = r.json()
-            answers = data.get("Answer", [])
-            if answers:
-                return answers[0]["data"].rstrip(".")
-        except Exception:
-            continue
-    return ""
-
-
-def doh_ns_query(domain: str) -> dict:
-    """
-    Query NS records via DoH. Returns NS names, IPs extracted from EDE errors,
-    and SERVFAIL status. Works when port 53 is blocked.
-
-    The extended_dns_errors in SERVFAIL responses expose the exact NS IPs
-    that were queried — this is how we identify the ghost zone's NS servers
-    even when they refuse all queries.
-    """
-    result = {"ns_names": [], "ns_ips": [], "status": None}
-    for doh_url in [
-        f"https://dns.google/resolve?name={domain}&type=NS",
-        f"https://cloudflare-dns.com/dns-query?name={domain}&type=NS",
-    ]:
-        try:
-            r = requests.get(
-                doh_url, timeout=8,
-                headers={"Accept": "application/dns-json"}
-            )
-            data = r.json()
-            result["status"] = data.get("Status")  # 0=NOERROR, 2=SERVFAIL, 3=NXDOMAIN
-
-            # NS names from Answer section (present when zone exists and responds)
-            for rec in data.get("Answer", []):
-                if rec.get("type") == 2:
-                    ns = rec["data"].rstrip(".")
-                    if ns not in result["ns_names"]:
-                        result["ns_names"].append(ns)
-
-            # NS IPs from extended_dns_errors EDE-23 (REFUSED) — present in SERVFAIL
-            # Format: "[205.251.198.204] rcode=REFUSED for domain/ns"
-            for ede in data.get("extended_dns_errors", []):
-                text = ede.get("extra_text", "")
-                m = re.search(r'\[(\d+\.\d+\.\d+\.\d+)\]', text)
-                if m:
-                    ip = m.group(1)
-                    if ip not in result["ns_ips"]:
-                        result["ns_ips"].append(ip)
-
-            # Also check Comment field (Cloudflare format)
-            comment = data.get("Comment", "")
-            if isinstance(comment, list):
-                comment = " ".join(comment)
-            for m in re.finditer(r'(\d+\.\d+\.\d+\.\d+):\d+', comment):
-                ip = m.group(1)
-                if ip not in result["ns_ips"]:
-                    result["ns_ips"].append(ip)
-
-            if result["status"] is not None:
-                break
-        except Exception:
-            continue
-    return result
-
-
-def identify_dns_provider(ns_names: list, ns_ips: list) -> str:
-    """Identify DNS provider from NS hostnames or IP ranges."""
-    all_text = " ".join(ns_names + ns_ips).lower()
-
-    for provider, patterns in DNS_PROVIDER_PATTERNS.items():
-        if any(p.lower() in all_text for p in patterns):
-            return provider
-
-    # IP range heuristics
-    for ip in ns_ips:
-        if ip.startswith("205.251."):
-            return "Route53"  # AWS Route53 anycast range
-        if ip.startswith("173.245.") or ip.startswith("198.41."):
-            return "Cloudflare"
-        if ip.startswith("216.239.") or ip.startswith("8.8."):
-            return "Google Cloud"
-
-    return "Unknown"
-
-
-def enrich_ghost_zone(domain: str, ns_records_from_scanner: list) -> dict:
-    """
-    Full enrichment for a GHOST_NS_ZONE_TAKEOVER finding.
-
-    Steps:
-      1. Query ghost zone NS via DoH → get NS IPs from EDE errors
-      2. Query parent zone NS via DoH → get parent NS IPs for comparison
-      3. PTR reverse lookup each ghost NS IP → get awsdns/azure/etc hostnames
-      4. Identify DNS provider
-      5. Cross-compare ghost vs parent NS IPs (confirms separate deleted zone)
-      6. Assess feasibility and generate claim script
-    """
-    enrichment = {
-        "ghost_ns_ips":     [],
-        "ghost_ns_names":   [],   # resolved via PTR
-        "parent_ns_ips":    [],
-        "parent_ns_names":  [],
-        "provider":         "Unknown",
-        "is_separate_zone": False,
-        "feasibility":      "UNKNOWN",
-        "claim_guide":      {},
-        "claim_script":     "",
-        "doh_status":       None,
-    }
-
-    # Step 1: DoH query for ghost zone (gets NS IPs from EDE errors on SERVFAIL)
-    ghost_info = doh_ns_query(domain)
-    enrichment["doh_status"] = ghost_info["status"]
-    enrichment["ghost_ns_ips"] = ghost_info["ns_ips"]
-    enrichment["ghost_ns_names"] = ghost_info["ns_names"]
-
-    # If DoH got NS names directly (zone partially responds), use those
-    # If not, fall back to scanner-provided NS records
-    if not enrichment["ghost_ns_names"] and ns_records_from_scanner:
-        enrichment["ghost_ns_names"] = ns_records_from_scanner
-
-    # Step 2: Resolve parent zone NS for comparison
-    parent_parts = domain.split(".")
-    for i in range(1, len(parent_parts) - 1):
-        parent = ".".join(parent_parts[i:])
-        parent_info = doh_ns_query(parent)
-        if parent_info["status"] == 0:  # NOERROR = live parent zone found
-            enrichment["parent_ns_ips"]   = parent_info["ns_ips"]
-            enrichment["parent_ns_names"] = parent_info["ns_names"]
-            break
-
-    # Step 3: PTR reverse lookup ghost NS IPs → get actual NS hostnames
-    if enrichment["ghost_ns_ips"] and not enrichment["ghost_ns_names"]:
-        for ip in enrichment["ghost_ns_ips"]:
-            hostname = ptr_lookup_doh(ip)
-            if hostname:
-                enrichment["ghost_ns_names"].append(hostname)
-
-    # Step 4: Identify provider
-    enrichment["provider"] = identify_dns_provider(
-        enrichment["ghost_ns_names"],
-        enrichment["ghost_ns_ips"]
-    )
-
-    # Step 5: Cross-compare NS IPs
-    ghost_set  = set(enrichment["ghost_ns_ips"])
-    parent_set = set(enrichment["parent_ns_ips"])
-    enrichment["is_separate_zone"] = bool(ghost_set) and not ghost_set.issubset(parent_set)
-    enrichment["ns_overlap"] = list(ghost_set & parent_set)
-
-    # Step 6: Feasibility + claim guide
-    provider = enrichment["provider"]
-    guide = GHOST_ZONE_CLAIM_GUIDES.get(provider, GHOST_ZONE_CLAIM_GUIDES["Unknown"])
-    enrichment["claim_guide"] = guide
-    enrichment["feasibility"] = guide.get("feasibility", "UNKNOWN")
-
-    # Generate claim script
-    enrichment["claim_script"] = _generate_claim_script(
-        domain, provider, enrichment["ghost_ns_names"], enrichment["ghost_ns_ips"]
-    )
-
-    return enrichment
-
-
-def _generate_claim_script(domain: str, provider: str, ns_names: list, ns_ips: list) -> str:
-    """Generate a provider-specific claim script for the ghost zone."""
-
-    if provider == "Route53":
-        # Build target NS set for the loop comparison
-        target_ns_str = " ".join(f'"{n}"' for n in ns_names) if ns_names else '"<ns-targets>"'
-        target_ns_comment = "\n".join(f"#   {n}  ({ip})" for n, ip in zip(ns_names, ns_ips)) if ns_names else "#   (run PTR lookups first)"
-
-        return f"""#!/usr/bin/env bash
-# Route53 Ghost Zone Claim Script
-# Target: {domain}
-# Ghost NS to match:
-{target_ns_comment}
-
-TARGET_NS=({target_ns_str})
-DOMAIN="{domain}"
-ATTEMPT=0
-
-echo "[*] Starting Route53 ghost zone claim loop for $DOMAIN"
-echo "[*] Target NS: ${{TARGET_NS[*]}}"
-echo ""
-
-while true; do
-    ATTEMPT=$((ATTEMPT + 1))
-    printf "[*] Attempt %d — creating hosted zone...\\r" "$ATTEMPT"
-
-    RESULT=$(aws route53 create-hosted-zone \\
-        --name "$DOMAIN" \\
-        --caller-reference "ghost-$(date +%s%N)" \\
-        --output json 2>/dev/null)
-
-    if [ $? -ne 0 ]; then
-        echo "[!] AWS CLI error — check credentials (aws configure)"
-        exit 1
-    fi
-
-    ZONE_ID=$(echo "$RESULT" | python3 -c \\
-        "import sys,json; print(json.load(sys.stdin)['HostedZone']['Id'].split('/')[-1])")
-
-    ASSIGNED_NS=$(echo "$RESULT" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-ns = sorted(d['DelegationSet']['NameServers'])
-print(' '.join(ns))
-")
-
-    TARGET_SORTED=$(printf '%s\\n' "${{TARGET_NS[@]}}" | sort | tr '\\n' ' ' | xargs)
-    ASSIGNED_SORTED=$(echo "$ASSIGNED_NS" | tr ' ' '\\n' | sort | tr '\\n' ' ' | xargs)
-
-    if [ "$ASSIGNED_SORTED" = "$TARGET_SORTED" ]; then
-        echo ""
-        echo "[!!!] MATCH on attempt $ATTEMPT — Zone ID: $ZONE_ID"
-        echo "[*] Assigned NS: $ASSIGNED_NS"
-        echo "[*] Adding TXT proof record..."
-
-        aws route53 change-resource-record-sets \\
-            --hosted-zone-id "$ZONE_ID" \\
-            --change-batch '{{
-                "Changes": [{{
-                    "Action": "CREATE",
-                    "ResourceRecordSet": {{
-                        "Name": "'"$DOMAIN"'",
-                        "Type": "TXT",
-                        "TTL": 300,
-                        "ResourceRecords": [{{"Value": "\\"subdomain-takeover-proof-shadowbyte\\""}}]
-                    }}
-                }}]
-            }}'
-
-        echo ""
-        echo "[*] Verify with:"
-        echo "    curl -s 'https://dns.google/resolve?name=$DOMAIN&type=TXT' | python3 -m json.tool"
-        echo "[*] Zone ID to keep: $ZONE_ID"
-        break
-    else
-        aws route53 delete-hosted-zone --id "$ZONE_ID" > /dev/null 2>&1
-        sleep 0.5
-    fi
-done
-"""
-
-    elif provider == "Azure DNS":
-        return f"""#!/usr/bin/env bash
-# Azure DNS Ghost Zone Claim Script
-# Target: {domain}
-# Ghost NS: {', '.join(ns_names) if ns_names else 'unknown (run PTR lookups)'}
-
-DOMAIN="{domain}"
-RESOURCE_GROUP="ghost-zone-rg"  # Change to your RG
-
-echo "[*] Creating Azure DNS zone for $DOMAIN"
-az group create --name "$RESOURCE_GROUP" --location eastus > /dev/null 2>&1
-
-RESULT=$(az dns zone create \\
-    --resource-group "$RESOURCE_GROUP" \\
-    --name "$DOMAIN" \\
-    --output json)
-
-ASSIGNED_NS=$(echo "$RESULT" | python3 -c \\
-    "import sys,json; [print(n) for n in json.load(sys.stdin)['nameServers']]")
-
-echo "[*] Azure assigned NS:"
-echo "$ASSIGNED_NS"
-echo ""
-echo "[*] Target NS to match:"
-printf '%s\\n' {' '.join(ns_names) if ns_names else '"(unknown)"'}
-echo ""
-echo "[*] Compare above — if all 4 match, add TXT proof:"
-echo "    az network dns record-set txt add-record \\\\"
-echo "        --resource-group $RESOURCE_GROUP \\\\"
-echo "        --zone-name $DOMAIN \\\\"
-echo "        --record-set-name @ \\\\"
-echo "        --value 'subdomain-takeover-proof-shadowbyte'"
-"""
-
-    elif provider == "DigitalOcean":
-        return f"""#!/usr/bin/env bash
-# DigitalOcean DNS Ghost Zone Claim Script
-# Target: {domain}
-# DigitalOcean always uses: ns1/ns2/ns3.digitalocean.com
-
-DOMAIN="{domain}"
-
-echo "[*] Creating DigitalOcean DNS zone for $DOMAIN"
-doctl compute domain create "$DOMAIN"
-
-echo "[*] Adding TXT proof record..."
-doctl compute domain records create "$DOMAIN" \\
-    --record-type TXT \\
-    --record-name "@" \\
-    --record-data "subdomain-takeover-proof-shadowbyte" \\
-    --record-ttl 300
-
-echo "[*] Verify: curl -s 'https://dns.google/resolve?name=$DOMAIN&type=TXT' | python3 -m json.tool"
-"""
-
-    else:
-        return f"""#!/usr/bin/env bash
-# Ghost Zone Claim — Provider: {provider}
-# Target: {domain}
-# Ghost NS IPs: {', '.join(ns_ips) if ns_ips else 'unknown'}
-# Ghost NS Names: {', '.join(ns_names) if ns_names else 'unknown (run PTR lookups)'}
-#
-# Manual steps:
-# 1. Identify the DNS provider from NS hostnames above
-# 2. Create an account and hosted zone for: {domain}
-# 3. Verify the assigned NS servers match the ghost NS names
-# 4. Add TXT record: subdomain-takeover-proof-shadowbyte
-# 5. Verify: curl -s 'https://dns.google/resolve?name={domain}&type=TXT' | python3 -m json.tool
-echo "Manual investigation required — provider: {provider}"
-"""
-
-
 # ─────────────────────────────────────────────────────────────
 # Takeover fingerprint database
+# Each key is matched as a suffix against the final CNAME target
 # ─────────────────────────────────────────────────────────────
 FINGERPRINTS = {
     # ── Azure ─────────────────────────────────────────────────
@@ -551,6 +121,7 @@ FINGERPRINTS = {
         "body_must": ["404", "ResourceNotFound"],
         "claim":     "Create APIM instance with matching name",
     },
+
     # ── AWS ───────────────────────────────────────────────────
     "s3.amazonaws.com": {
         "service":   "AWS S3 Bucket",
@@ -582,6 +153,7 @@ FINGERPRINTS = {
         "body_must": [],
         "claim":     "Not directly claimable",
     },
+
     # ── Google Cloud ──────────────────────────────────────────
     "storage.googleapis.com": {
         "service":   "Google Cloud Storage",
@@ -613,6 +185,7 @@ FINGERPRINTS = {
         "body_must": ["Not Found", "404"],
         "claim":     "Deploy Firebase Hosting project with matching site ID",
     },
+
     # ── GitHub ────────────────────────────────────────────────
     "github.io": {
         "service":      "GitHub Pages",
@@ -622,21 +195,25 @@ FINGERPRINTS = {
         "claim":        "Create GitHub repo with matching username/org and enable Pages",
         "github_check": True,
     },
+
     # ── Heroku ────────────────────────────────────────────────
     "herokuapp.com": {
-        "service":   "Heroku",
-        "cost":      "FREE (free dyno removed, but still claimable)",
-        "severity":  "HIGH",
-        "body_must": ["No such app", "herokucdn.com/error-pages/no-such-app"],
-        "claim":     "Create Heroku app with matching name",
+        "service":      "Heroku",
+        "cost":         "FREE (free dyno removed, but still claimable)",
+        "severity":     "HIGH",
+        "body_must":    ["No such app", "herokucdn.com/error-pages/no-such-app"],
+        "claim":        "Create Heroku app with matching name",
+        "heroku_check": True,   # Use GET api.heroku.com/apps/{name} (unauthenticated, 404=claimable)
     },
     "herokussl.com": {
-        "service":   "Heroku SSL",
-        "cost":      "FREE",
-        "severity":  "HIGH",
-        "body_must": ["No such app"],
-        "claim":     "Create Heroku app with matching name",
+        "service":      "Heroku SSL",
+        "cost":         "FREE",
+        "severity":     "HIGH",
+        "body_must":    ["No such app"],
+        "claim":        "Create Heroku app with matching name",
+        "heroku_check": True,
     },
+
     # ── WordPress ─────────────────────────────────────────────
     "wordpress.com": {
         "service":   "WordPress.com",
@@ -653,6 +230,7 @@ FINGERPRINTS = {
         "body_must": ["Site is not available", "not associated with any active site on the WP Engine platform"],
         "claim":     "Create WP Engine install with matching name",
     },
+
     # ── Netlify ───────────────────────────────────────────────
     "netlify.app": {
         "service":   "Netlify",
@@ -668,6 +246,7 @@ FINGERPRINTS = {
         "body_must": ["Not Found - Request ID"],
         "claim":     "Create Netlify site with matching subdomain",
     },
+
     # ── Vercel ────────────────────────────────────────────────
     "vercel.app": {
         "service":   "Vercel",
@@ -683,6 +262,7 @@ FINGERPRINTS = {
         "body_must": ["The deployment could not be found"],
         "claim":     "Deploy Vercel project",
     },
+
     # ── Shopify ───────────────────────────────────────────────
     "myshopify.com": {
         "service":   "Shopify",
@@ -691,6 +271,7 @@ FINGERPRINTS = {
         "body_must": ["Sorry, this shop is currently unavailable", "Only one step left"],
         "claim":     "Create Shopify store with matching name",
     },
+
     # ── Zendesk ───────────────────────────────────────────────
     "zendesk.com": {
         "service":   "Zendesk",
@@ -699,6 +280,7 @@ FINGERPRINTS = {
         "body_must": ["Help Center Closed", "Oops, this help center no longer exists"],
         "claim":     "Create Zendesk subdomain with matching name",
     },
+
     # ── Freshdesk ─────────────────────────────────────────────
     "freshdesk.com": {
         "service":   "Freshdesk",
@@ -707,6 +289,7 @@ FINGERPRINTS = {
         "body_must": ["There is no helpdesk with this URL"],
         "claim":     "Create Freshdesk account with matching subdomain",
     },
+
     # ── HelpScout ─────────────────────────────────────────────
     "helpscoutdocs.com": {
         "service":   "HelpScout Docs",
@@ -715,6 +298,7 @@ FINGERPRINTS = {
         "body_must": ["No settings were found for this company"],
         "claim":     "Create HelpScout Docs site with matching subdomain",
     },
+
     # ── Ghost ─────────────────────────────────────────────────
     "ghost.io": {
         "service":   "Ghost",
@@ -723,6 +307,7 @@ FINGERPRINTS = {
         "body_must": ["The thing you were looking for is no longer here", "404"],
         "claim":     "Create Ghost publication with matching subdomain",
     },
+
     # ── Fastly ────────────────────────────────────────────────
     "fastly.net": {
         "service":   "Fastly CDN",
@@ -731,6 +316,7 @@ FINGERPRINTS = {
         "body_must": ["Fastly error: unknown domain", "Please check that this domain has been added to a service"],
         "claim":     "Create Fastly service with matching domain",
     },
+
     # ── Surge ─────────────────────────────────────────────────
     "surge.sh": {
         "service":   "Surge.sh",
@@ -739,6 +325,7 @@ FINGERPRINTS = {
         "body_must": ["project not found", "Surge - 404"],
         "claim":     "Deploy Surge project to matching subdomain (surge deploy --domain <target>)",
     },
+
     # ── Render ────────────────────────────────────────────────
     "onrender.com": {
         "service":   "Render",
@@ -747,6 +334,7 @@ FINGERPRINTS = {
         "body_must": ["Service Not Found", "404 - Service Not Found"],
         "claim":     "Create Render service with matching name",
     },
+
     # ── Fly.io ────────────────────────────────────────────────
     "fly.dev": {
         "service":   "Fly.io",
@@ -755,6 +343,7 @@ FINGERPRINTS = {
         "body_must": ["404", "Unknown app"],
         "claim":     "Create Fly.io app with matching name",
     },
+
     # ── Tumblr ────────────────────────────────────────────────
     "tumblr.com": {
         "service":   "Tumblr",
@@ -763,6 +352,7 @@ FINGERPRINTS = {
         "body_must": ["There's nothing here.", "Whatever you were looking for doesn't currently exist"],
         "claim":     "Create Tumblr blog with matching custom domain",
     },
+
     # ── Bitbucket ─────────────────────────────────────────────
     "bitbucket.io": {
         "service":   "Bitbucket Pages",
@@ -771,6 +361,7 @@ FINGERPRINTS = {
         "body_must": ["Repository not found", "The page you have requested does not exist"],
         "claim":     "Create Bitbucket repo with matching Pages config",
     },
+
     # ── UserVoice ─────────────────────────────────────────────
     "uservoice.com": {
         "service":   "UserVoice",
@@ -779,6 +370,7 @@ FINGERPRINTS = {
         "body_must": ["This UserVoice subdomain is currently available"],
         "claim":     "Register UserVoice account with matching subdomain",
     },
+
     # ── Cargo ─────────────────────────────────────────────────
     "cargocollective.com": {
         "service":   "Cargo Collective",
@@ -787,6 +379,7 @@ FINGERPRINTS = {
         "body_must": ["404 Not Found"],
         "claim":     "Create Cargo account with matching subdomain",
     },
+
     # ── Desk.com / Salesforce ─────────────────────────────────
     "desk.com": {
         "service":   "Desk.com (Salesforce)",
@@ -795,6 +388,7 @@ FINGERPRINTS = {
         "body_must": ["Sorry, We couldn't find your desk.com"],
         "claim":     "Register Desk.com account with matching subdomain",
     },
+
     # ── Intercom ─────────────────────────────────────────────
     "intercom.io": {
         "service":   "Intercom",
@@ -805,7 +399,7 @@ FINGERPRINTS = {
     },
 }
 
-# GCP Load Balancer IP prefixes
+# GCP Load Balancer IP prefixes (anycast, used for GCS backend buckets)
 GCP_LB_PREFIXES = [
     "35.190.", "35.191.", "35.201.", "35.220.", "35.241.",
     "34.96.", "34.98.", "34.102.", "34.104.", "34.107.",
@@ -814,21 +408,28 @@ GCP_LB_PREFIXES = [
     "216.58.", "216.239.",
 ]
 
+# CNAME targets that are NOT re-claimable by attackers — suppress DANGLING_CNAME_NXDOMAIN for these
 NON_CLAIMABLE_CNAME_SUFFIXES = [
-    ".elb.amazonaws.com",
-    ".execute-api.amazonaws.com",
-    ".awsglobalaccelerator.com",
-    ".amazonaws.com",
+    ".elb.amazonaws.com",          # ELB names encode account ID hash — not re-claimable
+    ".execute-api.amazonaws.com",  # API Gateway unique IDs
+    ".awsglobalaccelerator.com",   # AWS Global Accelerator
+    ".amazonaws.com",              # Generic AWS services (catch-all if above don't match)
 ]
 
+# Already-taken-over content patterns (non-owner serving malicious/spam content)
+# Only include patterns that indicate a *real* hijack — not server misconfigurations.
+# Default web server pages (IIS/Nginx/Apache) are NOT included here; they're just unconfigured servers.
 HIJACKED_PATTERNS = [
+    # Confirmed malicious/spam takeover content
     (r"เว็บพนัน|คาสิโน|สล็อต|บาคาร่า", "Thai gambling site"),
     (r"казино|ставки|слоты|покер", "Russian gambling site"),
     (r"online.{0,30}casino|gambling.{0,30}bonus|free.{0,30}slots|sports.{0,30}betting", "Gambling content"),
     (r"viagra|cialis|pharmacy.*online|buy.*pills.*cheap", "Pharma spam"),
+    # Domain parking / for-sale pages
     (r"this domain is for sale|buy this domain|domain.*available.*purchase", "Domain for sale"),
     (r"GoDaddy.*auction|Sedo\.com.*domain|sedoparking", "Domain parking service"),
     (r"parkingcrew\.net|bodis\.com|above\.com.*parking", "Domain parking service"),
+    # Thai gambling variant
     (r"(?:แทงบอล|เดิมพัน|ทดลองเล่น|สมัครสมาชิก).{0,30}(?:ฟรี|เครดิต|โบนัส)", "Thai gambling site (confirmed takeover)"),
 ]
 
@@ -838,10 +439,11 @@ HIJACKED_PATTERNS = [
 # ─────────────────────────────────────────────────────────────
 
 def resolve_cname_chain(domain: str, resolver: dns.resolver.Resolver) -> list[str]:
+    """Follow CNAME chain and return all targets."""
     chain = []
     current = domain
     visited = set()
-    for _ in range(10):
+    for _ in range(10):  # max chain depth
         if current in visited:
             break
         visited.add(current)
@@ -857,6 +459,7 @@ def resolve_cname_chain(domain: str, resolver: dns.resolver.Resolver) -> list[st
 
 
 def resolve_a(domain: str, resolver: dns.resolver.Resolver) -> list[str]:
+    """Resolve A records."""
     try:
         ans = resolver.resolve(domain, "A")
         return [str(r) for r in ans]
@@ -865,6 +468,7 @@ def resolve_a(domain: str, resolver: dns.resolver.Resolver) -> list[str]:
 
 
 def resolve_ns(domain: str, resolver: dns.resolver.Resolver) -> list[str]:
+    """Resolve NS records."""
     try:
         ans = resolver.resolve(domain, "NS")
         return [str(r).rstrip(".") for r in ans]
@@ -873,6 +477,7 @@ def resolve_ns(domain: str, resolver: dns.resolver.Resolver) -> list[str]:
 
 
 def check_nxdomain(domain: str, resolver: dns.resolver.Resolver) -> bool:
+    """Return True if domain is NXDOMAIN."""
     try:
         resolver.resolve(domain, "A")
         return False
@@ -883,10 +488,13 @@ def check_nxdomain(domain: str, resolver: dns.resolver.Resolver) -> bool:
 
 
 def check_servfail(domain: str, resolver: dns.resolver.Resolver = None) -> bool:
+    """Return True if domain returns SERVFAIL (indicates ghost NS / lame delegation)."""
+    # Use resolver's nameserver if available, otherwise fall back to subprocess dig
     ns_ip = None
     if resolver and resolver.nameservers:
         ns_ip = resolver.nameservers[0]
     else:
+        # Parse system resolv.conf
         try:
             with open("/etc/resolv.conf") as f:
                 for line in f:
@@ -899,6 +507,7 @@ def check_servfail(domain: str, resolver: dns.resolver.Resolver = None) -> bool:
     if ns_ip:
         try:
             request = dns.message.make_query(domain, dns.rdatatype.A)
+            # Try TCP first (more reliable in restricted envs), then UDP
             try:
                 response = dns.query.tcp(request, ns_ip, timeout=5)
             except Exception:
@@ -907,35 +516,25 @@ def check_servfail(domain: str, resolver: dns.resolver.Resolver = None) -> bool:
         except Exception:
             pass
 
+    # Final fallback: subprocess dig
     try:
         import subprocess
+        result = subprocess.run(
+            ["dig", "+short", "+time=4", domain, "A"],
+            capture_output=True, text=True, timeout=8
+        )
+        # SERVFAIL shows nothing in +short output but status differs
         result2 = subprocess.run(
             ["dig", "+time=4", domain, "A"],
             capture_output=True, text=True, timeout=8
         )
         return "SERVFAIL" in result2.stdout
     except Exception:
-        pass
-
-    # Final fallback: DoH (works when raw DNS port 53 is firewalled)
-    try:
-        for doh in [
-            f"https://dns.google/resolve?name={domain}&type=A",
-            f"https://cloudflare-dns.com/dns-query?name={domain}&type=A",
-        ]:
-            r = requests.get(doh, timeout=8, headers={"Accept": "application/dns-json"})
-            data = r.json()
-            if data.get("Status") == 2:  # SERVFAIL
-                return True
-            if data.get("Status") is not None:
-                return False  # NOERROR or NXDOMAIN — not a SERVFAIL
-    except Exception:
-        pass
-
-    return False
+        return False
 
 
 def get_zone_apex(domain: str) -> str:
+    """Get zone apex (e.g., sub.example.com → example.com)."""
     parts = domain.split(".")
     if len(parts) >= 2:
         return ".".join(parts[-2:])
@@ -943,29 +542,48 @@ def get_zone_apex(domain: str) -> str:
 
 
 def find_dead_ancestor(domain: str, resolver) -> tuple | None:
+    """
+    Walk up the DNS tree from domain's immediate parent toward the root.
+    Return (ancestor, ns_records) for the HIGHEST (fewest labels) dead ancestor —
+    i.e., the actual zone root — stopping when a live zone is found.
+
+    Examples:
+      cowgirlscountry.X.addondomain5.alphafx.ca
+        → X.addondomain5.alphafx.ca SERVFAILs, addondomain5.alphafx.ca SERVFAILs,
+          alphafx.ca is LIVE → returns addondomain5.alphafx.ca (the zone root)
+      sub.addondomain01.alphafx.ca
+        → addondomain01.alphafx.ca SERVFAILs, alphafx.ca is LIVE
+        → returns addondomain01.alphafx.ca
+      rmdemofix.alpha.co.uk
+        → alpha.co.uk is LIVE → returns None (rmdemofix is the dead zone itself)
+    """
     parts = domain.split(".")
     last_dead_zone = None
     last_dead_ns: list = []
     for i in range(1, len(parts)):
         ancestor = ".".join(parts[i:])
         if len(ancestor.split(".")) < 2:
-            break
+            break  # Never query bare TLDs
         with _zone_servfail_lock:
             if ancestor not in _zone_servfail_cache:
                 _zone_servfail_cache[ancestor] = check_servfail(ancestor, resolver)
             is_dead = _zone_servfail_cache[ancestor]
         if is_dead:
+            # Keep walking up — there may be a higher dead zone
             last_dead_zone = ancestor
             last_dead_ns = resolve_ns(ancestor, resolver)
         else:
+            # Live ancestor found — stop here; anything above is live
             break
     return (last_dead_zone, last_dead_ns) if last_dead_zone else None
 
 
 def check_ns_live(ns_host: str) -> bool:
+    """Check if an NS server actually responds to DNS queries."""
     try:
         ip = socket.gethostbyname(ns_host)
         request = dns.message.make_query("test.invalid", dns.rdatatype.A)
+        # Try TCP then UDP
         try:
             dns.query.tcp(request, ip, timeout=4)
             return True
@@ -973,6 +591,7 @@ def check_ns_live(ns_host: str) -> bool:
             dns.query.udp(request, ip, timeout=4)
             return True
     except Exception:
+        # Final fallback: dig NS
         try:
             import subprocess
             r = subprocess.run(
@@ -985,11 +604,17 @@ def check_ns_live(ns_host: str) -> bool:
 
 
 def is_malformed_cname(cname_target: str, source_domain: str) -> bool:
+    """
+    Return True if a CNAME target looks malformed — i.e., the source domain's
+    zone apex is appended to the CNAME value (common DNS misconfiguration).
+    Example: source=something.mycccportal.com, cname=okta.com.mycccportal.com
+    """
     zone = get_zone_apex(source_domain)
     return cname_target.endswith("." + zone) and cname_target != source_domain
 
 
 def check_ns_resolves(ns_host: str) -> bool:
+    """Return True if the NS hostname itself resolves (the NS server exists in DNS)."""
     try:
         socket.gethostbyname(ns_host)
         return True
@@ -998,6 +623,7 @@ def check_ns_resolves(ns_host: str) -> bool:
 
 
 def is_gcp_lb_ip(ip: str) -> bool:
+    """Return True if IP looks like a GCP global load balancer."""
     return any(ip.startswith(prefix) for prefix in GCP_LB_PREFIXES)
 
 
@@ -1011,6 +637,7 @@ HEADERS = {
 }
 
 def http_get(url: str, timeout: int = 8, follow_redirects: bool = True) -> tuple[int, str, dict]:
+    """Return (status_code, body_text, response_headers)."""
     try:
         r = requests.get(
             url, headers=HEADERS, timeout=timeout,
@@ -1030,28 +657,48 @@ def http_get(url: str, timeout: int = 8, follow_redirects: bool = True) -> tuple
 
 
 def check_fingerprint(body: str, status: int, fp: dict) -> bool:
+    """Return True if HTTP response matches takeover fingerprint."""
     body_lower = body.lower()
+    # Check required body strings
     for phrase in fp.get("body_must", []):
         if phrase.lower() in body_lower:
             return True
+    # Check expected status codes (standalone OR as supplement to empty-body responses)
     expected_codes = fp.get("http_codes", [])
     if expected_codes and status in expected_codes:
+        # If no body phrases are set, code alone confirms
         if not fp.get("body_must"):
             return True
+        # If body is empty/connection dropped, code alone confirms
         if not body.strip():
             return True
     return False
 
 
+# Phrases commonly placed by attackers who have already exploited a subdomain takeover
 ALREADY_EXPLOITED_PHRASES = [
-    "takeover by", "subdomain takeover", "taken over by",
-    "hacked by", "pwned by", "owned by", "bug bounty poc",
-    "proof of concept takeover", "this domain has been claimed",
-    "this subdomain has been taken", "erfix", "takeover poc", "subdomain poc",
+    "takeover by",
+    "subdomain takeover",
+    "taken over by",
+    "hacked by",
+    "pwned by",
+    "owned by",
+    "bug bounty poc",
+    "proof of concept takeover",
+    "this domain has been claimed",
+    "this subdomain has been taken",
+    "erfix",                   # known active claimer
+    "takeover poc",
+    "subdomain poc",
 ]
 
 
 def check_already_exploited(body: str) -> str:
+    """
+    Return the matched phrase if the HTTP response body contains indicators
+    that a third party has already claimed/exploited this subdomain.
+    Returns empty string if no match.
+    """
     body_lower = body.lower()
     for phrase in ALREADY_EXPLOITED_PHRASES:
         if phrase in body_lower:
@@ -1060,10 +707,12 @@ def check_already_exploited(body: str) -> str:
 
 
 def check_gcs_bucket(bucket_name: str) -> tuple[bool, str]:
+    """Check if a GCS bucket exists via the GCS JSON API."""
     url = f"https://storage.googleapis.com/storage/v1/b/{bucket_name}"
     try:
         r = requests.get(url, timeout=8, verify=False, headers=HEADERS)
         if r.status_code == 404:
+            # GCS API returns errors as a list: data["error"]["errors"][0]["reason"]
             try:
                 data = r.json()
                 errors = data.get("error", {}).get("errors", [])
@@ -1078,7 +727,51 @@ def check_gcs_bucket(bucket_name: str) -> tuple[bool, str]:
         return False, f"GCS check error: {e}"
 
 
+def check_heroku_app_exists(cname_target: str) -> bool:
+    """
+    Return True if the Heroku app that owns the CNAME target EXISTS.
+    If the app exists, the slot is taken — not claimable.
+
+    Uses the unauthenticated Heroku Platform API:
+        GET https://api.heroku.com/apps/{app-name}
+        200 / 304 → app exists  → NOT claimable (return True)
+        404       → app missing → CLAIMABLE   (return False)
+
+    cname_target example: 'vf-friends-and-family.herokuapp.com'
+    """
+    parts = cname_target.lower().rstrip(".").split(".")
+    # Extract app name: first label of *.herokuapp.com or *.herokussl.com
+    if len(parts) < 2 or parts[-2] not in ("herokuapp", "herokussl"):
+        return True  # Unrecognised pattern — fail safe
+    app_name = parts[0]
+    try:
+        r = requests.get(
+            f"https://api.heroku.com/apps/{app_name}",
+            timeout=8,
+            headers={
+                **HEADERS,
+                "Accept": "application/vnd.heroku+json; version=3",
+            },
+            verify=False,
+            allow_redirects=True,
+        )
+        if r.status_code == 404:
+            return False   # App deleted — slot claimable
+        if r.status_code in (200, 304):
+            return True    # App exists — NOT claimable
+        # Any other status (401, 429, 5xx) — fail safe to avoid false positives
+        return True
+    except Exception:
+        return True  # Network error — fail safe
+
+
 def check_github_user_exists(cname_target: str) -> bool:
+    """
+    Return True if the GitHub user/org that owns the github.io subdomain EXISTS.
+    If the user exists, the Pages namespace is taken — not claimable.
+    cname_target example: 'someuser.github.io'
+    """
+    # Extract username: 'someuser.github.io' → 'someuser'
     parts = cname_target.lower().rstrip(".").split(".")
     if len(parts) < 3 or parts[-2] != "github" or parts[-1] != "io":
         return False
@@ -1091,15 +784,19 @@ def check_github_user_exists(cname_target: str) -> bool:
             verify=False,
         )
         if r.status_code == 200:
-            return True
+            return True   # User/org confirmed exists — NOT claimable
         if r.status_code == 403:
+            # Rate-limited — cannot confirm either way; treat as EXISTS to avoid
+            # false positives during high-thread scans (GitHub API: 60 req/hr unauth)
             return True
-        return False
+        return False  # 404 = user doesn't exist → claimable
     except Exception:
-        return True
+        return True  # On network error, fail safe — do NOT report as claimable
 
 
 def check_s3_bucket(bucket_name: str) -> tuple[bool, str]:
+    """Check if an S3 bucket exists (and is unclaimed)."""
+    # Clean bucket name (strip www., etc.)
     clean = bucket_name.replace("www.", "")
     url = f"https://{clean}.s3.amazonaws.com/"
     try:
@@ -1114,6 +811,10 @@ def check_s3_bucket(bucket_name: str) -> tuple[bool, str]:
 
 
 def check_azure_blob(container_name: str) -> tuple[bool, str]:
+    """Check for Azure Blob Storage takeover via common account patterns."""
+    # Heuristic: try common account name patterns
+    # Real check: CNAME to <account>.blob.core.windows.net
+    # The container_name IS the full blob URL target
     url = f"https://{container_name}/"
     status, body, _ = http_get(url)
     if status in (404, 400) and any(x in body for x in ["BlobNotFound", "ResourceNotFound", "The specified resource does not exist"]):
@@ -1122,6 +823,7 @@ def check_azure_blob(container_name: str) -> tuple[bool, str]:
 
 
 def detect_hijacked_content(body: str) -> tuple[bool, str]:
+    """Check if response body looks like non-owner malicious/parked content."""
     for pattern, label in HIJACKED_PATTERNS:
         if re.search(pattern, body, re.IGNORECASE):
             return True, label
@@ -1129,11 +831,14 @@ def detect_hijacked_content(body: str) -> tuple[bool, str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Core scan logic
+# Core scan logic for a single domain
 # ─────────────────────────────────────────────────────────────
 
-def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = False,
-                enrich_ghost: bool = True) -> dict:
+def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = False) -> dict:
+    """
+    Perform all checks on a single domain.
+    Returns a result dict with findings.
+    """
     domain = domain.strip().lower().rstrip(".")
     if not domain:
         return {}
@@ -1148,21 +853,26 @@ def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = Fa
         "status":        "clean",
     }
 
+    # ── 1. CNAME chain resolution ─────────────────────────────
     cname_chain = resolve_cname_chain(domain, resolver)
     result["cname_chain"] = cname_chain
 
+    # ── 2. A record resolution ────────────────────────────────
     a_records = resolve_a(domain, resolver)
     result["a_records"] = a_records
 
-    # ── CNAME fingerprint matching ─────────────────────────
-    seen_services = set()
+    # ── 4. CNAME to NXDOMAIN (dangling) ──────────────────────
+    # Removed: DANGLING_CNAME_NXDOMAIN was too noisy — it fired for unclaimable
+    # third-party managed hostnames (Akamai, Epsilon, IBM, etc.). Known claimable
+    # platforms are handled with confirmed fingerprints in step 5 below.
+
+    # ── 5. CNAME fingerprint matching ─────────────────────────
+    seen_services = set()  # deduplicate: only report each service once per domain
     for cname_target in cname_chain:
         matched_service = None
         matched_key = None
         for fp_key, fp_data in FINGERPRINTS.items():
-            # Require proper dot-boundary suffix match to avoid
-            # "notfastly.net" matching "fastly.net", etc.
-            if cname_target == fp_key or cname_target.endswith("." + fp_key):
+            if cname_target.endswith(fp_key) or fp_key in cname_target:
                 matched_service = fp_data
                 matched_key = fp_key
                 break
@@ -1170,16 +880,20 @@ def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = Fa
         if not matched_service:
             continue
 
+        # Skip if we've already reported this service (or a related Azure service) for this domain
         svc_name = matched_service["service"]
+        # Group all Azure services — if any Azure service already matched, skip redundant ones
         svc_group = "Azure" if "Azure" in svc_name else svc_name
         if svc_group in seen_services:
             continue
         seen_services.add(svc_group)
         seen_services.add(svc_name)
 
+        # Skip clearly non-claimable (AWS ELBs etc.)
         if matched_service.get("severity") == "INFO":
             continue
 
+        # HTTP fingerprint check on both the domain and the CNAME target
         finding = {
             "type":         "CNAME_TAKEOVER_CANDIDATE",
             "severity":     matched_service["severity"],
@@ -1192,6 +906,7 @@ def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = Fa
             "fingerprint_detail":    "",
         }
 
+        # HTTP check on the subdomain itself
         status, body, headers = http_get(f"https://{domain}/")
         if status == 0:
             status, body, headers = http_get(f"http://{domain}/")
@@ -1201,11 +916,13 @@ def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = Fa
 
         if check_fingerprint(body, status, matched_service):
             finding["fingerprint_confirmed"] = True
+            # Find which phrase matched
             for phrase in matched_service.get("body_must", []):
                 if phrase.lower() in body.lower():
                     finding["fingerprint_detail"] = f'Response contains: "{phrase}"'
                     break
 
+        # Also check the CNAME target directly
         if not finding["fingerprint_confirmed"]:
             st2, bd2, _ = http_get(f"https://{cname_target}/")
             if check_fingerprint(bd2, st2, matched_service):
@@ -1214,11 +931,13 @@ def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = Fa
                     if phrase.lower() in bd2.lower():
                         finding["fingerprint_detail"] = f'CNAME target response contains: "{phrase}"'
                         break
+                # If confirmed by HTTP status code (e.g., WordPress 410 Gone)
                 if not finding["fingerprint_detail"]:
                     ec = matched_service.get("http_codes", [])
                     if ec and st2 in ec:
-                        finding["fingerprint_detail"] = f'CNAME target {cname_target} returned HTTP {st2}'
+                        finding["fingerprint_detail"] = f'CNAME target {cname_target} returned HTTP {st2} ({matched_service["service"]} deleted/inactive)'
 
+        # Service-specific API checks
         if matched_service.get("gcs_check") or (not cname_chain and is_gcp_lb_ip(a_records[0] if a_records else "")):
             vuln, msg = check_gcs_bucket(domain)
             if vuln:
@@ -1231,13 +950,56 @@ def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = Fa
                 finding["fingerprint_confirmed"] = True
                 finding["fingerprint_detail"] = msg
 
+        # NOTE: NXDOMAIN on trafficmanager.net / azurewebsites.net is NOT confirmation.
+        # Traffic Manager returns NXDOMAIN when a profile is disabled or has no healthy
+        # endpoints — the profile still exists and the name is NOT claimable.
+        # Azure App Service returns NXDOMAIN when stopped, but the name stays reserved
+        # in Azure's global namespace. Only the HTTP fingerprint is reliable for both.
+
         if matched_service.get("github_check") and finding["fingerprint_confirmed"]:
+            # Verify the GitHub user/org doesn't exist — if they do, Pages namespace is taken
             if check_github_user_exists(cname_target):
                 finding["fingerprint_confirmed"] = False
-                finding["fingerprint_detail"] = f"GitHub user '{cname_target.split('.')[0]}' exists — not claimable"
+                finding["fingerprint_detail"] = f"GitHub user '{cname_target.split('.')[0]}' exists — Pages namespace taken, not claimable"
 
+        if matched_service.get("heroku_check"):
+            # Use Heroku Platform API (unauthenticated):
+            # GET api.heroku.com/apps/{name} → 200/304 = app exists (NOT claimable), 404 = claimable
+            # This is more reliable than body fingerprinting — Heroku returns 503 "No such app" page
+            # only when the app slug is fully deleted; the API check is authoritative.
+            app_exists = check_heroku_app_exists(cname_target)
+            if app_exists:
+                # App still registered on Heroku — slug is taken, not claimable
+                finding["fingerprint_confirmed"] = False
+                finding["fingerprint_detail"] = (
+                    f"Heroku app '{cname_target.split('.')[0]}' confirmed EXISTS via API "
+                    f"(api.heroku.com/apps/{cname_target.split('.')[0]} → 200) — slot is taken, not claimable"
+                )
+            else:
+                # App does not exist — confirmed claimable via API
+                finding["fingerprint_confirmed"] = True
+                finding["fingerprint_detail"] = (
+                    f"Heroku app '{cname_target.split('.')[0]}' confirmed DELETED via API "
+                    f"(api.heroku.com/apps/{cname_target.split('.')[0]} → 404) — slot is claimable"
+                )
+
+        # Don't report if HTTP check shows the service is clearly live and healthy.
+        # Any response from the CNAME target (including 4xx from live Azure/CDN services)
+        # that doesn't match the takeover fingerprint means the slot is occupied.
+        #
+        # IMPORTANT: Always verify the CNAME target directly, even when fingerprint was
+        # confirmed on the source domain. The source domain check can produce false positives
+        # on Azure App Service when the custom domain isn't mapped — the App Service itself
+        # returns "404 Web Site not found" for any unregistered custom domain Host header,
+        # even though the App Service slot is taken. Checking the target directly (with its
+        # own hostname as Host) reveals the real state of the slot.
         st_target, bd_target, _ = http_get(f"https://{cname_target}/")
 
+        # ── Already-exploited check ───────────────────────────────────────
+        # If a third party has already claimed the slot and is actively serving
+        # content, the service fingerprint won't match (returns 200, not the
+        # "unclaimed" error page). Detect this by looking for attacker phrases
+        # in both the source domain response and the CNAME target response.
         exploit_phrase = check_already_exploited(body) or check_already_exploited(bd_target)
         if exploit_phrase:
             finding["type"]                 = "ALREADY_EXPLOITED_TAKEOVER"
@@ -1245,28 +1007,24 @@ def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = Fa
             finding["fingerprint_confirmed"] = True
             finding["fingerprint_detail"]   = (
                 f'Response contains exploitation indicator: "{exploit_phrase}" — '
-                f'a third party has already claimed this slot'
+                f'a third party has already claimed this slot and is serving content'
             )
             result["findings"].append(finding)
             continue
+        # ─────────────────────────────────────────────────────────────────
 
-        # If CNAME target is unreachable (HTTP 0), we have no evidence the slot
-        # is free — suppress unless fingerprint was already confirmed by the
-        # source domain check. Avoids FPs on firewalled/CDN-edge targets.
-        if st_target == 0 and not finding["fingerprint_confirmed"]:
-            continue
-
-        # If target returned a live non-matching response, slot is occupied
-        target_alive = st_target not in (0, None) and not check_fingerprint(bd_target, st_target, matched_service)
+        target_alive = st_target != 0 and not check_fingerprint(bd_target, st_target, matched_service)
         if target_alive:
-            continue
+            continue  # Slot is occupied — source domain false positive (e.g. custom domain not mapped)
 
+        # Only report confirmed findings — unconfirmed candidates are too noisy and
+        # produce false positives on platforms where the slot may still be occupied.
         if not finding["fingerprint_confirmed"]:
             continue
 
         result["findings"].append(finding)
 
-    # ── GCS via A record ──────────────────────────────────
+    # ── 6. GCS via A record (load balancer backend) ───────────
     if not cname_chain and a_records:
         for ip in a_records:
             if is_gcp_lb_ip(ip):
@@ -1284,99 +1042,41 @@ def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = Fa
                     })
                 break
 
-    # ── Zone / NS checks ──────────────────────────────────
-    # Confirm SERVFAIL twice (different queries) to filter transient resolver errors.
-    # A single SERVFAIL can be a resolver timeout, NXDOMAIN race, or rate-limit.
-    if check_servfail(domain, resolver) and check_servfail(domain, resolver):
+    # ── 7. Zone / NS checks ───────────────────────────────────
+    # Check for SERVFAIL (ghost NS / lame delegation)
+    if check_servfail(domain, resolver):
+        # Walk up all ancestors to find the actual dead zone boundary.
+        # If a closer ancestor SERVFAILs, this domain is just a cascade — suppress it
+        # and record the ancestor as a synthetic finding instead.
         dead = find_dead_ancestor(domain, resolver)
         if dead:
             dead_zone, dead_ns = dead
             with _synthetic_ghost_lock:
                 if dead_zone not in _synthetic_ghost_zones:
                     _synthetic_ghost_zones[dead_zone] = dead_ns
+            # Suppress this domain's finding — the real finding is the dead ancestor
         else:
+            # This domain IS the dead zone (no living ancestor found)
             ns_records = resolve_ns(domain, resolver)
             result["ns_records"] = ns_records
-
-            # Sanity check via DoH: if DoH also returns NXDOMAIN (not SERVFAIL),
-            # the domain doesn't exist at all — not a ghost zone, suppress finding.
-            doh_status_check = doh_ns_query(domain).get("status")
-            if doh_status_check == 3:  # NXDOMAIN
-                # Not a ghost zone — subdomain simply doesn't exist
-                # Record as informational and skip
-                result["findings"].append({
-                    "type":     "DNS_NXDOMAIN",
-                    "severity": "INFO",
-                    "detail":   f"{domain} returns SERVFAIL from local resolver but NXDOMAIN via DoH — domain does not exist, not a ghost zone",
-                    "impact":   "No takeover possible — NXDOMAIN confirmed via DoH",
-                })
-                if result["findings"]:
-                    result["status"] = "VULNERABLE"
-                return result
-
-            # ── Ghost Zone Enrichment ──────────────────────────
-            ghost_enrichment = {}
-            if enrich_ghost:
-                try:
-                    ghost_enrichment = enrich_ghost_zone(domain, ns_records)
-                except Exception as e:
-                    ghost_enrichment = {"error": str(e)}
-
-            # Confidence scoring: count how many independent signals confirm this
-            # is a real ghost zone vs a transient SERVFAIL.
-            _conf_signals = []
-            _conf_signals.append("SERVFAIL x2 confirmed")  # already checked above
-            if doh_status_check == 2:
-                _conf_signals.append("DoH also returns SERVFAIL")
-            if ns_records:
-                _conf_signals.append(f"{len(ns_records)} NS record(s) found in parent zone")
-
-            finding = {
-                "type":           "GHOST_NS_ZONE_TAKEOVER",
-                "severity":       "CRITICAL",
-                "detail":         f"{domain} returns SERVFAIL — delegated NS servers do not hold the zone",
-                "ns_servers":     ns_records,
-                "impact":         "Full DNS zone takeover possible — register hosted zone on the same provider with matching NS names",
-                "claim":          "Create a hosted zone with same NS servers (e.g., AWS Route53) and add matching NS records",
-                "conf_signals":   _conf_signals,
-                "confidence":     len(_conf_signals),
-            }
-
-            # Merge enrichment into finding
-            if ghost_enrichment and not ghost_enrichment.get("error"):
-                finding["ghost_ns_ips"]      = ghost_enrichment.get("ghost_ns_ips", [])
-                finding["ghost_ns_names"]     = ghost_enrichment.get("ghost_ns_names", [])
-                finding["parent_ns_names"]    = ghost_enrichment.get("parent_ns_names", [])
-                finding["provider"]           = ghost_enrichment.get("provider", "Unknown")
-                finding["is_separate_zone"]   = ghost_enrichment.get("is_separate_zone", False)
-                finding["feasibility"]        = ghost_enrichment.get("feasibility", "UNKNOWN")
-                finding["claim_guide"]        = ghost_enrichment.get("claim_guide", {})
-                finding["ns_overlap"]         = ghost_enrichment.get("ns_overlap", [])
-                # Override claim with enriched provider-specific instruction
-                guide = ghost_enrichment.get("claim_guide", {})
-                if guide.get("method"):
-                    finding["claim"] = guide["method"]
-
-            # FP guard: if enrichment ran but could NOT confirm a separate zone,
-            # downgrade severity — it may be a transient SERVFAIL, not a ghost zone.
-            # Only applies when enrichment succeeded (ghost_ns_ips present).
-            if (finding.get("ghost_ns_ips") and
-                    not finding.get("is_separate_zone", True)):
-                finding["severity"] = "HIGH"
-                finding["fp_warning"] = (
-                    "is_separate_zone=False — ghost NS IPs overlap with parent zone. "
-                    "May be a transient SERVFAIL or split-horizon config, not a true ghost zone. "
-                    "Verify manually before reporting."
-                )
-
-            result["findings"].append(finding)
-
+            result["findings"].append({
+                "type":       "GHOST_NS_ZONE_TAKEOVER",
+                "severity":   "CRITICAL",
+                "detail":     f"{domain} returns SERVFAIL — delegated NS servers do not hold the zone",
+                "ns_servers": ns_records,
+                "impact":     "Full DNS zone takeover possible — register hosted zone on the same provider (e.g., Route53) with matching NS names",
+                "claim":      "Create a hosted zone with same NS servers (e.g., AWS Route53) and add matching NS records",
+            })
     elif not a_records and not cname_chain:
+        # Domain doesn't resolve at all — check if NS servers respond.
+        # Use check_ns_resolves (not TCP reachability): if the NS hostname itself is NXDOMAIN
+        # it's a truly dead NS (lame delegation). If it resolves but is firewalled, it's live.
         ns_records = resolve_ns(domain, resolver)
         if ns_records:
             result["ns_records"] = ns_records
             dead_ns = [ns for ns in ns_records if not check_ns_resolves(ns)]
             if dead_ns and len(dead_ns) == len(ns_records):
+                # All NS hostnames don't exist at all → true lame delegation
                 result["findings"].append({
                     "type":      "LAME_NS_DELEGATION",
                     "severity":  "HIGH",
@@ -1385,7 +1085,7 @@ def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = Fa
                     "claim":     f"Register {dead_ns[0]} and host a DNS server authoritative for {domain}",
                 })
 
-    # ── Already-hijacked ──────────────────────────────────
+    # ── 8. Already-taken-over / misconfigured (non-owner content) ────────────
     if a_records or cname_chain:
         status, body, headers = http_get(f"https://{domain}/")
         if status == 0:
@@ -1421,7 +1121,7 @@ SEV_COLOR = {
 }
 
 
-def print_finding(finding: dict, domain: str, save_scripts: bool = False):
+def print_finding(finding: dict, domain: str):
     sev = finding.get("severity", "INFO")
     color = SEV_COLOR.get(sev, CYAN)
     ftype = finding.get("type", "")
@@ -1448,61 +1148,6 @@ def print_finding(finding: dict, domain: str, save_scripts: bool = False):
         print(f"         NS      : {', '.join(finding.get('ns_servers', []))}")
         print(f"         Impact  : {finding['impact']}")
 
-        # Enhanced enrichment output
-        provider = finding.get("provider")
-        if provider:
-            pcolor = RED + BOLD if provider == "Route53" else YELLOW
-            print(f"         Provider: {c(pcolor, provider)}")
-
-        ghost_ns_names = finding.get("ghost_ns_names", [])
-        ghost_ns_ips   = finding.get("ghost_ns_ips", [])
-        if ghost_ns_names or ghost_ns_ips:
-            print(f"         Ghost NS:")
-            for name, ip in zip(ghost_ns_names, ghost_ns_ips):
-                print(f"           {c(CYAN, name)}  ({ip})")
-            # Unmatched extras
-            for name in ghost_ns_names[len(ghost_ns_ips):]:
-                print(f"           {c(CYAN, name)}")
-            for ip in ghost_ns_ips[len(ghost_ns_names):]:
-                print(f"           (PTR pending)  ({ip})")
-
-        parent_ns = finding.get("parent_ns_names", [])
-        if parent_ns:
-            print(f"         Parent NS: {', '.join(parent_ns)}")
-
-        is_sep = finding.get("is_separate_zone")
-        if is_sep is not None:
-            sep_str = c(RED + BOLD, "YES — confirmed separate deleted zone") if is_sep else c(YELLOW, "NO — same zone (unusual)")
-            print(f"         Separate Zone: {sep_str}")
-
-        feasibility = finding.get("feasibility")
-        if feasibility:
-            fcol = RED + BOLD if "HIGH" in feasibility else YELLOW
-            print(f"         Feasibility: {c(fcol, feasibility)}")
-
-        guide = finding.get("claim_guide", {})
-        if guide:
-            print(f"         Method  : {guide.get('method', '')}")
-            if guide.get("note"):
-                print(f"         Note    : {c(DIM, guide['note'])}")
-            steps = guide.get("steps", [])
-            if steps:
-                print(f"         Steps   :")
-                for step in steps:
-                    print(f"                   {step}")
-
-        # Confidence signals
-        conf_sigs = finding.get("conf_signals", [])
-        conf = finding.get("confidence", 0)
-        if conf_sigs:
-            conf_col = GREEN if conf >= 3 else YELLOW if conf == 2 else RED
-            print(f"         Confidence: {c(conf_col, str(conf))}/3  ({', '.join(conf_sigs)})")
-
-        # FP warning (shown when is_separate_zone could not be confirmed)
-        fp_warn = finding.get("fp_warning", "")
-        if fp_warn:
-            print(f"         {c(YELLOW, '⚠ FP RISK :')} {fp_warn}")
-
     elif ftype == "LAME_NS_DELEGATION":
         print(f"         Detail  : {finding['detail']}")
         print(f"         Impact  : {finding['impact']}")
@@ -1517,6 +1162,10 @@ def print_finding(finding: dict, domain: str, save_scripts: bool = False):
         print(f"         Chain   : {finding.get('cname_chain', '')}")
         print(f"         Match   : {finding.get('fingerprint_detail', '')}")
         print(f"         Status  : {c(RED + BOLD, 'ACTIVELY EXPLOITED — third party is serving content')}")
+
+    elif ftype == "DANGLING_CNAME_NXDOMAIN":
+        print(f"         Detail  : {finding['detail']}")
+        print(f"         Impact  : {finding['impact']}")
 
     else:
         print(f"         Detail  : {finding.get('detail', '')}")
@@ -1577,10 +1226,17 @@ def print_summary(results: list[dict], elapsed: float):
 
 
 # ─────────────────────────────────────────────────────────────
-# Post-processing
+# Post-processing: false positive reduction
 # ─────────────────────────────────────────────────────────────
 
 def deduplicate_zone_findings(results: list[dict]) -> list[dict]:
+    """
+    Suppress GHOST_NS_ZONE_TAKEOVER findings for subdomains when their
+    zone apex is also flagged with GHOST_NS_ZONE_TAKEOVER.
+
+    Example: if telematicsco.net is flagged, suppress all
+    *.telematicsco.net findings — they're just cascading SERVFAILs.
+    """
     ghost_domains = set(
         r["domain"] for r in results
         if any(f["type"] == "GHOST_NS_ZONE_TAKEOVER" for f in r.get("findings", []))
@@ -1592,6 +1248,7 @@ def deduplicate_zone_findings(results: list[dict]) -> list[dict]:
             if finding["type"] != "GHOST_NS_ZONE_TAKEOVER":
                 new_findings.append(finding)
                 continue
+            # Check if any parent zone is already flagged
             parts = domain.split(".")
             parent_flagged = any(
                 ".".join(parts[i:]) in ghost_domains and ".".join(parts[i:]) != domain
@@ -1599,6 +1256,7 @@ def deduplicate_zone_findings(results: list[dict]) -> list[dict]:
             )
             if not parent_flagged:
                 new_findings.append(finding)
+            # else: suppress — parent zone is the real finding
         result["findings"] = new_findings
         if not result["findings"]:
             result["status"] = "clean"
@@ -1610,12 +1268,15 @@ def deduplicate_zone_findings(results: list[dict]) -> list[dict]:
 # ─────────────────────────────────────────────────────────────
 
 def extract_hostname(raw: str) -> str:
+    """Extract hostname from a URL or plain domain string."""
     raw = raw.strip()
     if raw.startswith("http"):
+        # Strip trailing [status] annotations from httpx output: "https://foo.com [200]"
         raw = re.sub(r'\s+\[\d+\].*$', '', raw)
         try:
             parsed = urlparse(raw)
             host = parsed.hostname or raw
+            # Skip bare IPs
             try:
                 ipaddress.ip_address(host)
                 return ""
@@ -1623,6 +1284,7 @@ def extract_hostname(raw: str) -> str:
                 return host.lower()
         except ValueError:
             return ""
+    # Skip bare IPs
     try:
         ipaddress.ip_address(raw)
         return ""
@@ -1645,7 +1307,7 @@ def load_domains(args) -> list[str]:
             host = extract_hostname(line)
             if host and not host.startswith("#"):
                 domains.append(host)
-    return list(dict.fromkeys(domains))
+    return list(dict.fromkeys(domains))  # deduplicate preserving order
 
 
 def main():
@@ -1656,23 +1318,21 @@ def main():
 Examples:
   python3 takeover.py -f subdomains.txt
   python3 takeover.py -f subdomains.txt -o results.json --threads 50 --verbose
-  python3 takeover.py -d preview.example.com
+  python3 takeover.py -d preview.cccis.com
   cat subdomains.txt | python3 takeover.py -
   python3 takeover.py -f live.txt --only-vulnerable
-  python3 takeover.py -d sub.example.com --no-enrich   # skip ghost zone enrichment
         """,
     )
-    parser.add_argument("-f", "--file",       metavar="FILE",   help="File with one domain per line")
-    parser.add_argument("-d", "--domain",     metavar="DOMAIN", help="Single domain to check")
-    parser.add_argument("-",  dest="stdin",   action="store_true", help="Read from stdin")
-    parser.add_argument("-o", "--output",     metavar="FILE",   help="Write JSON results to file")
-    parser.add_argument("-t", "--threads",    metavar="N",      type=int, default=30, help="Concurrent threads (default: 30)")
-    parser.add_argument("--timeout",          metavar="SEC",    type=int, default=8,  help="HTTP/DNS timeout (default: 8)")
-    parser.add_argument("--nameserver",       metavar="IP",     default=None,         help="DNS resolver IP")
-    parser.add_argument("--verbose",  "-v",   action="store_true", help="Show all domains")
-    parser.add_argument("--only-vulnerable",  action="store_true", help="Only print vulnerable findings")
-    parser.add_argument("--no-color",         action="store_true", help="Disable color output")
-    parser.add_argument("--no-enrich",        action="store_true", help="Skip ghost zone NS enrichment (faster, less info)")
+    parser.add_argument("-f", "--file",    metavar="FILE",   help="File with one domain per line (supports URLs)")
+    parser.add_argument("-d", "--domain",  metavar="DOMAIN", help="Single domain to check")
+    parser.add_argument("-",  dest="stdin",action="store_true", help="Read from stdin")
+    parser.add_argument("-o", "--output",  metavar="FILE",   help="Write JSON results to file")
+    parser.add_argument("-t", "--threads", metavar="N",      type=int, default=30, help="Concurrent threads (default: 30)")
+    parser.add_argument("--timeout",       metavar="SEC",    type=int, default=8,  help="HTTP/DNS timeout seconds (default: 8)")
+    parser.add_argument("--nameserver",    metavar="IP",     default=None,         help="DNS resolver IP (default: system resolver from /etc/resolv.conf)")
+    parser.add_argument("--verbose",  "-v", action="store_true", help="Show all domains, not just vulnerable")
+    parser.add_argument("--only-vulnerable", action="store_true", help="Only print vulnerable findings")
+    parser.add_argument("--no-color",      action="store_true", help="Disable color output")
     args = parser.parse_args()
 
     if args.no_color:
@@ -1684,29 +1344,23 @@ Examples:
         parser.print_help()
         sys.exit(1)
 
-    resolver = dns.resolver.Resolver(configure=False)
+    # Configure resolver
+    resolver = dns.resolver.Resolver()
     if args.nameserver:
         resolver.nameservers = [args.nameserver]
-    else:
-        try:
-            sys_res = dns.resolver.Resolver()
-            resolver.nameservers = sys_res.nameservers
-        except Exception:
-            resolver.nameservers = ["1.1.1.1", "8.8.8.8"]
+    # else: use system resolver from /etc/resolv.conf (default)
     resolver.timeout = args.timeout
     resolver.lifetime = args.timeout
 
     ns_display = args.nameserver or resolver.nameservers[0]
-    enrich = not args.no_enrich
-
     print(c(BOLD, f"\ntakeover.py — scanning {len(domains)} domain(s) @ {args.threads} threads"))
-    print(c(DIM,  f"Resolver: {ns_display}  Timeout: {args.timeout}s  Ghost enrichment: {'ON' if enrich else 'OFF'}\n"))
+    print(c(DIM,  f"Resolver: {ns_display}  Timeout: {args.timeout}s\n"))
 
     start = datetime.now()
     results = []
 
     def scan_one(domain):
-        result = scan_domain(domain, resolver, verbose=args.verbose, enrich_ghost=enrich)
+        result = scan_domain(domain, resolver, verbose=args.verbose)
         with _print_lock:
             print_result(result, verbose=args.verbose and not args.only_vulnerable)
         return result
@@ -1725,47 +1379,30 @@ Examples:
 
     elapsed = (datetime.now() - start).total_seconds()
 
-    # Inject synthetic ghost zone findings
+    # Inject synthetic ghost zone findings for dead intermediate zones discovered
+    # during scan (zones not in the input list but found via subdomain SERVFAIL cascade)
     scanned_domains = {r["domain"] for r in results}
     for zone_domain, ns_recs in _synthetic_ghost_zones.items():
         if zone_domain not in scanned_domains:
-            # Enrich synthetic findings too
-            ghost_enrichment = {}
-            if enrich:
-                try:
-                    ghost_enrichment = enrich_ghost_zone(zone_domain, ns_recs)
-                except Exception:
-                    pass
-
-            finding = {
-                "type":       "GHOST_NS_ZONE_TAKEOVER",
-                "severity":   "CRITICAL",
-                "detail":     f"{zone_domain} returns SERVFAIL — zone delegation exists but hosted zone deleted (discovered via subdomain cascade)",
-                "ns_servers": ns_recs,
-                "impact":     "Full DNS zone takeover possible — register hosted zone on the same provider with matching NS names",
-                "claim":      "Create a hosted zone with same NS servers (e.g., AWS Route53) and add matching NS records",
-            }
-            if ghost_enrichment and not ghost_enrichment.get("error"):
-                finding.update({
-                    "ghost_ns_ips":    ghost_enrichment.get("ghost_ns_ips", []),
-                    "ghost_ns_names":  ghost_enrichment.get("ghost_ns_names", []),
-                    "parent_ns_names": ghost_enrichment.get("parent_ns_names", []),
-                    "provider":        ghost_enrichment.get("provider", "Unknown"),
-                    "is_separate_zone":ghost_enrichment.get("is_separate_zone", False),
-                    "feasibility":     ghost_enrichment.get("feasibility", "UNKNOWN"),
-                    "claim_guide":     ghost_enrichment.get("claim_guide", {}),
-                })
-
             synthetic_result = {
                 "domain":    zone_domain,
                 "status":    "VULNERABLE",
                 "synthetic": True,
-                "findings":  [finding],
+                "findings":  [{
+                    "type":       "GHOST_NS_ZONE_TAKEOVER",
+                    "severity":   "CRITICAL",
+                    "detail":     f"{zone_domain} returns SERVFAIL — zone delegation exists but hosted zone has been deleted (discovered via subdomain cascade)",
+                    "ns_servers": ns_recs,
+                    "impact":     "Full DNS zone takeover possible — register hosted zone on the same provider (e.g., Route53) with matching NS names",
+                    "claim":      "Create a hosted zone with same NS servers (e.g., AWS Route53) and add matching NS records",
+                }],
             }
             results.append(synthetic_result)
             print_result(synthetic_result, verbose=False)
 
+    # Post-processing: collapse cascading SERVFAIL zone findings
     results = deduplicate_zone_findings(results)
+
     print_summary(results, elapsed)
 
     if args.output:
