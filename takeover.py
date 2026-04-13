@@ -397,6 +397,133 @@ FINGERPRINTS = {
         "body_must": ["Uh oh. That page doesn't exist."],
         "claim":     "Create Intercom workspace with matching domain",
     },
+
+    # ── Agile CRM ─────────────────────────────────────────────
+    "agilecrm.com": {
+        "service":   "Agile CRM",
+        "cost":      "FREE tier",
+        "severity":  "HIGH",
+        "body_must": ["Sorry, this page is no longer available."],
+        "claim":     "Register Agile CRM account with matching subdomain",
+    },
+
+    # ── Anima ─────────────────────────────────────────────────
+    "animaapp.io": {
+        "service":   "Anima",
+        "cost":      "FREE",
+        "severity":  "HIGH",
+        "body_must": ["The page you were looking for does not exist."],
+        "claim":     "Create Anima project with matching subdomain",
+    },
+
+    # ── Discourse ─────────────────────────────────────────────
+    "trydiscourse.com": {
+        "service":   "Discourse",
+        "cost":      "FREE trial",
+        "severity":  "HIGH",
+        "body_must": [],
+        "nxdomain":  True,
+        "claim":     "Create Discourse instance with matching subdomain",
+    },
+
+    # ── Gemfury ───────────────────────────────────────────────
+    "furyns.com": {
+        "service":   "Gemfury",
+        "cost":      "FREE",
+        "severity":  "HIGH",
+        "body_must": ["404: This page could not be found."],
+        "claim":     "Create Gemfury account with matching subdomain",
+    },
+
+    # ── HatenaBlog ────────────────────────────────────────────
+    "hatenablog.com": {
+        "service":   "HatenaBlog",
+        "cost":      "FREE",
+        "severity":  "HIGH",
+        "body_must": ["404 Blog is not found"],
+        "claim":     "Register HatenaBlog with matching subdomain",
+    },
+
+    # ── Help Juice ────────────────────────────────────────────
+    "helpjuice.com": {
+        "service":   "Help Juice",
+        "cost":      "PAID",
+        "severity":  "HIGH",
+        "body_must": ["We could not find what you're looking for."],
+        "claim":     "Create Help Juice account with matching subdomain",
+    },
+
+    # ── JetBrains YouTrack ────────────────────────────────────
+    "youtrack.cloud": {
+        "service":   "JetBrains YouTrack",
+        "cost":      "FREE (up to 10 users)",
+        "severity":  "HIGH",
+        "body_must": ["is not a registered InCloud YouTrack"],
+        "claim":     "Register YouTrack Cloud instance with matching subdomain",
+    },
+
+    # ── Ngrok ─────────────────────────────────────────────────
+    "ngrok.io": {
+        "service":   "Ngrok",
+        "cost":      "FREE",
+        "severity":  "HIGH",
+        "body_must": ["Tunnel "],
+        "claim":     "Create Ngrok tunnel with matching subdomain (paid plan)",
+    },
+
+    # ── Readme.io ─────────────────────────────────────────────
+    "readme.io": {
+        "service":   "Readme.io",
+        "cost":      "PAID",
+        "severity":  "HIGH",
+        "body_must": ["The creators of this project are still working on making everything perfect!"],
+        "claim":     "Create Readme.io project with matching subdomain",
+    },
+
+    # ── Strikingly ────────────────────────────────────────────
+    "s.strikinglydns.com": {
+        "service":   "Strikingly",
+        "cost":      "FREE",
+        "severity":  "HIGH",
+        "body_must": ["PAGE NOT FOUND."],
+        "claim":     "Create Strikingly site with matching subdomain",
+    },
+
+    # ── SurveySparrow ─────────────────────────────────────────
+    "surveysparrow.com": {
+        "service":   "SurveySparrow",
+        "cost":      "FREE trial",
+        "severity":  "HIGH",
+        "body_must": ["Account not found."],
+        "claim":     "Create SurveySparrow account with matching subdomain",
+    },
+
+    # ── Uberflip ──────────────────────────────────────────────
+    "read.uberflip.com": {
+        "service":   "Uberflip",
+        "cost":      "PAID",
+        "severity":  "HIGH",
+        "body_must": ["The URL you've accessed does not provide a hub."],
+        "claim":     "Create Uberflip hub with matching domain",
+    },
+
+    # ── Uptimerobot ───────────────────────────────────────────
+    "stats.uptimerobot.com": {
+        "service":   "Uptimerobot",
+        "cost":      "FREE",
+        "severity":  "HIGH",
+        "body_must": ["page not found"],
+        "claim":     "Create Uptimerobot status page with matching subdomain",
+    },
+
+    # ── Worksites ─────────────────────────────────────────────
+    "worksites.net": {
+        "service":   "Worksites",
+        "cost":      "FREE",
+        "severity":  "HIGH",
+        "body_must": ["Hello! Sorry, but the website you're looking for doesn't exist."],
+        "claim":     "Create Worksites account with matching domain",
+    },
 }
 
 # GCP Load Balancer IP prefixes (anycast, used for GCS backend buckets)
