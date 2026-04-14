@@ -542,6 +542,47 @@ NON_CLAIMABLE_CNAME_SUFFIXES = [
     ".amazonaws.com",              # Generic AWS services (catch-all if above don't match)
 ]
 
+# ─────────────────────────────────────────────────────────────
+# Services that do NOT require root domain ownership verification.
+# On these platforms you can claim any subdomain slug directly —
+# just create an account and register the matching name/project.
+# This is a stronger signal for claimability vs. platforms like
+# Azure that tie resources to a subscription tied to the domain.
+#
+# Displayed in output as: ⚡ NO ROOT OWNERSHIP CHECK
+# GCS and S3 buckets are always in this category too (bucket name
+# is the only lock; no domain verification needed).
+# ─────────────────────────────────────────────────────────────
+NO_ROOT_OWNERSHIP_REQUIRED = {
+    "github.io",            # create user/org with matching name, enable Pages
+    "web.app",              # Firebase: create project, site ID = subdomain label
+    "firebaseapp.com",      # same as above
+    "netlify.app",          # create site with matching subdomain slug
+    "netlify.com",          # same
+    "surge.sh",             # surge deploy --domain <exact-subdomain>
+    "vercel.app",           # deploy with matching project name
+    "now.sh",               # Vercel legacy
+    "onrender.com",         # create service with matching name
+    "fly.dev",              # fly apps create <name>
+    "cargocollective.com",  # create account with matching subdomain
+    "ghost.io",             # create publication with matching subdomain
+    "tumblr.com",           # add custom domain to any blog
+    "bitbucket.io",         # create repo with matching Pages config
+    "herokuapp.com",        # create app with matching slug
+    "herokussl.com",        # same
+    "wordpress.com",        # re-register the exact <slug>.wordpress.com
+    "uservoice.com",        # register account with matching subdomain
+    "animaapp.io",          # create project with matching subdomain
+    "hatenablog.com",       # register blog with matching subdomain
+    "helpjuice.com",        # create account with matching subdomain
+    "furyns.com",           # Gemfury: create account with matching subdomain
+    "surveysparrow.com",    # create account with matching subdomain
+    "worksites.net",        # create account with matching domain
+    "ngrok.io",             # create tunnel with matching subdomain (paid)
+    "readme.io",            # create project with matching subdomain
+    "s.strikinglydns.com",  # create Strikingly site with matching subdomain
+}
+
 # Already-taken-over content patterns (non-owner serving malicious/spam content)
 # Only include patterns that indicate a *real* hijack — not server misconfigurations.
 # Default web server pages (IIS/Nginx/Apache) are NOT included here; they're just unconfigured servers.
@@ -550,12 +591,38 @@ NON_CLAIMABLE_CNAME_SUFFIXES = [
 # The label should describe WHO/WHAT took it over so the report is actionable.
 HIJACKED_PATTERNS = [
     # ── Bug bounty / security researcher PoC injections ──────────
-    # Researchers who successfully took over a subdomain often inject one of these as proof
-    (r"console\.log\(['\"].*[Tt]akeover|[Hh]ijack|[Pp]o[Cc]|[Bb]ug\s*[Bb]ounty", "Security researcher PoC (console.log injection)"),
+    # Broad console.log match: catches any bare console.log("name") or console.log('anything')
+    # placed as a PoC in the page source — regardless of content.
+    # Must be inside a <script> tag or a raw JS context to avoid matching legitimate log output
+    # embedded in error pages. We allow a short optional tag prefix but require the call to be
+    # the *only* meaningful thing in the body (or clearly a PoC standalone script).
+    #
+    # Pattern breakdown:
+    #   (?:<script[^>]*>)?  — optional opening <script> tag (may or may not be present)
+    #   \s*                 — optional whitespace
+    #   console\.log\(      — the call
+    #   \s*['"` ]           — opening quote/backtick
+    #   [^'"` \n]{1,120}    — content: any non-quote chars up to 120 chars (username, flag, message)
+    #   ['"` ]              — closing quote
+    #   \s*\)               — closing paren
+    #
+    # This catches: console.log("username"), console.log('shadowbyte was here'), console.log(`poc`)
+    # It does NOT fire on multi-argument calls like console.log("error:", data) because those
+    # won't close the quote before the comma — reducing noise on real app log statements.
+    (
+        r'(?:<script[^>]*>)?\s*console\.log\(\s*[\'"`][^\'"`\n]{1,120}[\'"`]\s*\)',
+        "Security researcher PoC (bare console.log injection)",
+    ),
+
+    # XSS-style alert PoC — alert("takeover") etc.
     (r"<script[^>]*>\s*alert\s*\(\s*['\"](?:takeover|hijack|xss|poc|owned|pwned|h1|hackerone|bugbounty)['\"]", "Security researcher XSS PoC (alert injection)"),
+
+    # document.title = "takeover" style PoC
     (r"document\.title\s*=\s*['\"](?:takeover|hijack|xss|poc|owned|pwned|h1)", "Security researcher PoC (document.title injection)"),
+
+    # Explicit takeover claim text in body
     (r"subdomain.{0,20}takeover|takeover.{0,20}poc|this\s+(?:sub)?domain\s+(?:has\s+been\s+)?(?:taken\s+over|hijacked|claimed)", "Security researcher takeover claim"),
-    (r"hackerone|bugcrowd|intigriti|yeswehack|synack.*report|bug\s*bounty\s*(?:poc|proof|claim)", "Bug bounty researcher claim"),
+    (r"bug\s*bounty\s*(?:poc|proof|claim)", "Bug bounty researcher claim"),
     (r"(?:taken over|hijacked) by [a-zA-Z0-9_-]{3,30}", "Takeover claimed by researcher"),
 
     # ── Gambling / spam ───────────────────────────────────────────
@@ -572,6 +639,32 @@ HIJACKED_PATTERNS = [
 
     # ── Generic hostile content indicators ────────────────────────
     (r"<script[^>]*src=['\"]https?://(?!(?:cdnjs|ajax\.googleapis|code\.jquery|cdn\.jsdelivr|unpkg))[a-z0-9.-]+\.[a-z]{2,}/[^'\"]{0,100}(?:miner|cryptojack|coinhive|coin-hive)", "Malicious takeover: Cryptojacker injected"),
+]
+
+# ─────────────────────────────────────────────────────────────
+# Body patterns that look like PoC injections but are actually
+# benign platform-owned default pages (e.g. Firebase "Site Not Found",
+# Netlify 404, Vercel deploy-not-found). These are checked BEFORE
+# HIJACKED_PATTERNS to suppress false positives: if the body matches
+# one of these exclusions AND the hijack pattern only matched because
+# of a generic JS token, we skip the hijack classification.
+# ─────────────────────────────────────────────────────────────
+HIJACKED_FALSE_POSITIVE_GUARDS = [
+    # Firebase Hosting default "Site Not Found" page
+    # (contains "hosting documentation" and the Firebase logo text)
+    r"firebase\.com/docs/hosting|firebaseapp\.com.*hosting|You haven't deployed an app yet|This is a custom domain, but we haven't finished setting it up",
+    # Netlify own 404
+    r"Not Found - Request ID: [a-zA-Z0-9-]+",
+    # Vercel deploy-not-found
+    r"DEPLOYMENT_NOT_FOUND|The deployment could not be found on Vercel",
+    # GitHub Pages "There isn't a GitHub Pages site here"
+    r"There isn't a GitHub Pages site here",
+    # Azure App Service default
+    r"404 Web Site not found.*microsoft|azure.*web.*app.*not.*found",
+    # Heroku no-such-app
+    r"herokucdn\.com/error-pages/no-such-app",
+    # Surge.sh project not found
+    r"project not found.*surge\.sh|surge\.sh.*project not found",
 ]
 
 
@@ -963,12 +1056,32 @@ def check_azure_blob(container_name: str) -> tuple[bool, str]:
     return False, f"Azure Blob status: {status}"
 
 
-def detect_hijacked_content(body: str) -> tuple[bool, str]:
-    """Check if response body looks like non-owner malicious/parked content."""
+def detect_hijacked_content(body: str) -> tuple[bool, str, str]:
+    """
+    Check if response body looks like non-owner malicious/parked content.
+
+    Returns (is_hijacked, label, matched_snippet).
+
+    False-positive guard: if the body matches a known platform default-error page
+    (e.g. Firebase "Site Not Found", Netlify 404) we skip hijack classification
+    even if the body happens to contain a token like 'console' — those pages are
+    served by the platform, not a third-party claimer.
+    """
+    # Check false-positive guards first — if any match, abort hijack detection
+    for guard_pattern in HIJACKED_FALSE_POSITIVE_GUARDS:
+        if re.search(guard_pattern, body, re.IGNORECASE | re.DOTALL):
+            return False, "", ""
+
     for pattern, label in HIJACKED_PATTERNS:
-        if re.search(pattern, body, re.IGNORECASE):
-            return True, label
-    return False, ""
+        m = re.search(pattern, body, re.IGNORECASE | re.DOTALL)
+        if m:
+            # Extract a short snippet around the match for the report
+            snippet = m.group(0)[:120].strip()
+            # Collapse whitespace for readability
+            snippet = re.sub(r'\s+', ' ', snippet)
+            return True, label, snippet
+
+    return False, "", ""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1232,15 +1345,16 @@ def scan_domain(domain: str, resolver: dns.resolver.Resolver, verbose: bool = Fa
         if status == 0:
             status, body, headers = http_get(f"http://{domain}/")
         if status not in (0, 403) and body:
-            hijacked, label = detect_hijacked_content(body)
+            hijacked, label, snippet = detect_hijacked_content(body)
             if hijacked:
                 result["findings"].append({
-                    "type":     "ALREADY_HIJACKED",
-                    "severity": "CRITICAL",
-                    "detail":   f"Response body matches: {label}",
-                    "url":      f"https://{domain}/",
+                    "type":        "ALREADY_HIJACKED",
+                    "severity":    "CRITICAL",
+                    "detail":      f"Response body matches: {label}",
+                    "matched":     snippet,
+                    "url":         f"https://{domain}/",
                     "http_status": status,
-                    "impact":   "Subdomain serving non-owner content — likely confirmed takeover, report immediately",
+                    "impact":      "Subdomain serving non-owner content — likely confirmed takeover, report immediately",
                 })
 
     if result["findings"]:
@@ -1270,8 +1384,18 @@ def print_finding(finding: dict, domain: str):
     print(f"  {color}[{sev}]{RESET} {c(BOLD, ftype)}")
 
     if ftype == "CNAME_TAKEOVER_CANDIDATE":
-        print(f"         Service : {finding['service']} ({finding['cost']})")
+        svc_name = finding['service']
+        cname_tgt = finding.get('cname_target', '')
+        # Check if this platform requires root domain ownership verification
+        no_root_check = any(cname_tgt.endswith(k) or k in cname_tgt for k in NO_ROOT_OWNERSHIP_REQUIRED)
+        ownership_flag = (
+            c(GREEN + BOLD, "  ⚡ NO ROOT OWNERSHIP CHECK — claim subdomain directly (high likelihood)")
+            if no_root_check else
+            c(YELLOW,        "  ⚠  Root domain ownership verification may be required")
+        )
+        print(f"         Service : {svc_name} ({finding['cost']})")
         print(f"         Chain   : {finding['cname_chain']}")
+        print(f"        {ownership_flag}")
         confirmed = finding.get("fingerprint_confirmed", False)
         conf_str = c(RED + BOLD, "CONFIRMED ✓") if confirmed else c(YELLOW, "unconfirmed (check manually)")
         print(f"         PoC     : {conf_str}")
@@ -1280,9 +1404,11 @@ def print_finding(finding: dict, domain: str):
         print(f"         Claim   : {finding['claim']}")
 
     elif ftype == "GCS_BUCKET_TAKEOVER":
+        # GCS buckets never require root domain ownership — any GCP account can claim
         print(f"         Service : {finding['service']}")
         print(f"         Detail  : {finding['detail']}")
         print(f"         Claim   : {finding['claim']}")
+        print(f"        {c(GREEN + BOLD, '  ⚡ NO ROOT OWNERSHIP CHECK — create bucket in any GCP project (high likelihood)')}")
 
     elif ftype == "GHOST_NS_ZONE_TAKEOVER":
         print(f"         Detail  : {finding['detail']}")
@@ -1295,6 +1421,8 @@ def print_finding(finding: dict, domain: str):
 
     elif ftype == "ALREADY_HIJACKED":
         print(f"         Detail  : {finding['detail']}")
+        if finding.get("matched"):
+            print(f"         Matched : {c(YELLOW, repr(finding['matched']))}")
         print(f"         URL     : {finding['url']} (HTTP {finding.get('http_status', '?')})")
         print(f"         Impact  : {finding['impact']}")
 
